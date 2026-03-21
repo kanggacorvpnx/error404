@@ -1,0 +1,111 @@
+#!/bin/bash
+export LANG=en_US.UTF-8
+
+### ===== AUTO CONFIG =====
+AUTO_SNI="www.cloudflare.com"
+AUTO_FIRSTPORT=10000
+AUTO_ENDPORT=65535
+AUTO_PORT=$(shuf -i 2000-65535 -n 1)
+AUTO_PROXYSITE="speedtest.net"
+### =======================
+
+HYPATH="/etc/hysteria"
+PASSFILE="$HYPATH/global.pass"
+USERDB="$HYPATH/users.db"
+
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+PLAIN="\033[0m"
+
+red(){ echo -e "${RED}$1${PLAIN}"; }
+green(){ echo -e "${GREEN}$1${PLAIN}"; }
+yellow(){ echo -e "${YELLOW}$1${PLAIN}"; }
+
+[[ $EUID -ne 0 ]] && red "Run as root" && exit 1
+
+realip(){
+  ip=$(curl -s4 ip.sb || curl -s6 ip.sb)
+}
+
+### ===== INSTALL HYSTERIA =====
+install_hysteria(){
+  realip
+  mkdir -p $HYPATH /root/hy
+
+  apt update
+  apt -y install curl wget openssl iptables-persistent netfilter-persistent
+
+  wget -q https://raw.githubusercontent.com/kanggacorvpnx/error404/main/udp/server_hy2.sh
+  bash server_hy2.sh
+  rm -f server_hy2.sh
+
+  [[ ! -f /usr/local/bin/hysteria ]] && red "Install failed" && exit 1
+
+  ### GLOBAL PASSWORD (AUTH + OBFS)
+  PASS=$(date +%s%N | md5sum | cut -c1-16)
+  echo "$PASS" > $PASSFILE
+
+  ### CERT
+  openssl ecparam -genkey -name prime256v1 -out $HYPATH/private.key
+  openssl req -new -x509 -days 36500 \
+    -key $HYPATH/private.key \
+    -out $HYPATH/cert.crt \
+    -subj "/CN=$AUTO_SNI"
+
+  ### IPTABLES PORT HOP
+  iptables -t nat -F PREROUTING
+  ip6tables -t nat -F PREROUTING
+  iptables -t nat -A PREROUTING -p udp --dport $AUTO_FIRSTPORT:$AUTO_ENDPORT -j DNAT --to :$AUTO_PORT
+  ip6tables -t nat -A PREROUTING -p udp --dport $AUTO_FIRSTPORT:$AUTO_ENDPORT -j DNAT --to :$AUTO_PORT
+  netfilter-persistent save >/dev/null 2>&1
+
+  ### SERVER CONFIG (STATIC – AMAN)
+  cat > $HYPATH/config.yaml <<EOF
+listen: :$AUTO_PORT
+tls:
+  cert: $HYPATH/cert.crt
+  key: $HYPATH/private.key
+
+obfs:
+  type: salamander
+  salamander:
+    password: $PASS
+
+auth:
+  type: password
+  password: $PASS
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$AUTO_PROXYSITE
+    rewriteHost: true
+EOF
+
+  ### SYSTEMD
+  cat > /lib/systemd/system/hysteria-server.service <<EOF
+[Unit]
+Description=Hysteria2 Server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/hysteria server --config $HYPATH/config.yaml
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable hysteria-server
+  systemctl restart hysteria-server
+
+  touch $USERDB
+
+  green "HYSTERIA2 INSTALLED & RUNNING"
+  menu
+}
+
+install_hysteria
